@@ -42,6 +42,30 @@
       when: "item.value.fstype != 'swap'"
       with_dict: '{{ mounts }}'
 
+    # A bind mount is cycled so that a changed source or changed options take effect, which the
+    # mount module alone would not do. That is only worth doing when something has changed: a bind
+    # mount already in use cannot be unmounted at all, and the attempt fails the play over a mount
+    # that is already correct.
+    #
+    # Source and target are the same inode once a bind mount is established, which is the exact
+    # test for "already in place" and needs no parsing of the mount table.
+    - name: List the bind mounts already in place
+      ansible.builtin.shell:
+        cmd: |
+          while read -r source directory; do
+            [ -e "${source}" ] && [ -e "${directory}" ] || continue
+            if [ "$(stat -c %d:%i -- "${source}")" = "$(stat -c %d:%i -- "${directory}")" ]; then
+              echo "${directory}"
+            fi
+          done <<'PAIRS'
+          {% for mount in mounts.values() if mount.source|length > 0 and 'bind' in mount.options.split(',') %}
+          {{ mount.source }} {{ mount.directory }}
+          {% endfor %}
+          PAIRS
+      changed_when: false
+      check_mode: false  # Its answer decides a later `when`, so a dry run needs the real one
+      register: mounts_established
+
     - name: Unmount the target directories
       ansible.builtin.mount:
         fstype: '{{ item.value.fstype }}'
@@ -51,7 +75,10 @@
         state: "{{ (item.value.fstype == 'swap')|ternary('absent', 'unmounted') }}"
       loop_control:
         label: '{{ item.value.source }} type {{ item.value.fstype }} -> {{ item.value.directory }}'
-      when: item.value.source|length == 0 or 'bind' in item.value.options.split(',')
+      when: >
+        item.value.source|length == 0
+        or ('bind' in item.value.options.split(',')
+            and item.value.directory not in mounts_established.stdout_lines)
       with_dict: '{{ mounts }}'
 
     - name: Mount the target directories
